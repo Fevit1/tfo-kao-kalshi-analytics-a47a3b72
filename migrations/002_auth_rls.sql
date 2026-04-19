@@ -1,0 +1,5 @@
+-- KAO Phase 1: No authentication layer. No RLS policies required.
+-- Security relies on obscure Vercel URL plus server-side API key proxy.
+-- All API keys are server-side only (KALSHI_API_KEY, PERPLEXITY_API_KEY, ANTHROPIC_API_KEY).
+-- The only permitted NEXT_PUBLIC_ variable is NEXT_PUBLIC_KALSHI_ENV (mode flag, no secret value).
+-- Phase 2 RLS scaffold is documented in the migration SQL comments for future reference.

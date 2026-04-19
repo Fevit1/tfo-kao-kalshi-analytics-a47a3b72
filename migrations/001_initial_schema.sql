@@ -1,0 +1,195 @@
+-- ============================================================
+-- KAO — Kalshi Analytics Optimizer
+-- Migration: initial_schema
+-- Date: Foundation build
+--
+-- ARCHITECTURE NOTE: KAO uses NO database in Phase 1.
+-- All persistence is browser localStorage only:
+--   localStorage:kalshi_watchlist  → WatchlistItem[]
+--   localStorage:kalshi_preferences → KalshiPreferences
+-- All runtime state is React Context (AnalysisContext).
+-- Market data is fetched live from Kalshi API on demand.
+--
+-- This migration file therefore contains:
+--   1. TypeScript type contracts (as SQL comments for reference)
+--   2. The single Supabase extension required for future Phase 2
+--      readiness (uuid-ossp) — safe to run, creates nothing visible
+--   3. No tables, no RLS, no indexes — intentional per blueprint
+-- ============================================================
+
+-- Enable uuid-ossp for Phase 2 readiness (no-op cost, safe to run)
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- ============================================================
+-- DATA CONTRACT REFERENCE (canonical TypeScript types)
+-- These are the authoritative shapes for all localStorage reads/
+-- writes and the AnalysisContext session cache. Kept here so the
+-- schema file is the single source of truth for the data model.
+-- ============================================================
+
+-- TYPE: Market (runtime only — never persisted to DB or localStorage)
+-- {
+--   ticker:       string          -- Kalshi market ticker, /^[A-Z0-9\-]{1,64}$/
+--   title:        string          -- Market question text, max 500 chars
+--   category:     string          -- Confirmed Kalshi API category value (see allowlist below)
+--   yes_price:    number          -- cents 0–99, equals implied probability %
+--   no_price:     number          -- cents 0–99
+--   volume:       number          -- total contracts traded
+--   close_date:   string          -- ISO 8601 timestamptz string
+--   rules_text:   string          -- Kalshi market rules, max 10000 chars
+--   kalshi_url:   string          -- validated to https://kalshi.com or https://demo-api.kalshi.co domain
+-- }
+
+-- TYPE: AnalysisResult (session cache — AnalysisContext Map<ticker, AnalysisResult>)
+-- {
+--   score:                number          -- 1–10, clamped by validateClaudeOutput()
+--   direction:            'YES'|'NO'|'PASS'
+--   assessed_probability: number          -- 0–100
+--   implied_probability:  number          -- 0–100
+--   confidence:           'high'|'medium'|'low'
+--   key_factors:          string[]
+--   key_uncertainties:    string[]
+--   prose_explanation:    string          -- escaped, never dangerouslySetInnerHTML
+--   perplexity_context:   string | null   -- null if Perplexity call failed
+--   perplexity_citations: string[]        -- each validated: URL.protocol === 'https:'
+--   analyzed_at:          string          -- ISO 8601 timestamptz
+--   prose_only?:          boolean         -- true if Claude JSON parse failed
+-- }
+
+-- TYPE: WatchlistItem (localStorage:kalshi_watchlist — WatchlistItem[])
+-- Deduplication key: ticker
+-- {
+--   ticker:               string          -- deduplication key
+--   title:                string
+--   category:             string
+--   score:                number          -- 1–10
+--   direction:            'YES'|'NO'|'PASS'
+--   assessed_probability: number          -- 0–100
+--   implied_probability:  number          -- 0–100
+--   confidence:           'high'|'medium'|'low'
+--   key_factors:          string[]
+--   summary:              string          -- one-sentence summary
+--   analyzed_at:          string          -- ISO 8601, updated on re-analyze
+--   kalshi_url:           string          -- validated to Kalshi domain before use
+--   saved_yes_price:      number          -- IMMUTABLE: set once at first save, NEVER overwritten on re-analyze
+--                                           price delta indicator always references this original anchor
+-- }
+-- mergeWatchlistItem() contract:
+--   On re-analyze: replace score, direction, assessed_probability, implied_probability,
+--                  confidence, key_factors, summary, analyzed_at
+--   NEVER replace: saved_yes_price
+
+-- TYPE: KalshiPreferences (localStorage:kalshi_preferences)
+-- Defaults applied when key absent or fails shape validation (try/catch resets to defaults)
+-- Default: { categories: <all confirmed Kalshi values>, sort_by: 'volume', last_updated: <now ISO> }
+-- {
+--   categories:    string[]         -- subset of confirmed Kalshi API category allowlist
+--   sort_by:       'score'|'volume'|'close_date'
+--   last_updated:  string           -- ISO 8601 timestamptz
+-- }
+
+-- ============================================================
+-- KALSHI CATEGORY ALLOWLIST
+-- Source: authenticated GET /markets call against Kalshi demo API
+-- at Foundation build time. SCHEMA agent records confirmed values here.
+-- Server-side /api/markets validates category param against this list.
+-- HTTP 400 returned on any unrecognized category value.
+-- UPDATE THIS COMMENT with actual values from live API call:
+-- Placeholder (to be replaced after Foundation API enumeration):
+--   'Politics', 'Economics', 'Finance', 'Climate', 'Sports',
+--   'Crypto', 'Culture', 'Science', 'Other'
+-- Confirmed values: [TO BE FILLED IN BY ENDPOINTS AGENT AFTER LIVE API CALL]
+-- ============================================================
+
+-- ============================================================
+-- ENVIRONMENT VARIABLE INVENTORY
+-- Server-side only (never NEXT_PUBLIC_ prefixed):
+--   KALSHI_API_KEY         — Kalshi demo API bearer token
+--   PERPLEXITY_API_KEY     — Perplexity Sonar API key
+--   ANTHROPIC_API_KEY      — Anthropic Claude API key
+--   KALSHI_ENV             — 'demo' | 'production' (Phase 1: always 'demo')
+--   ANTHROPIC_MODEL        — exact Claude Sonnet model slug confirmed at Foundation
+--                            (e.g. 'claude-3-5-sonnet-20241022' — confirm against live API)
+-- Public (safe to expose — mode flag only, no secret value):
+--   NEXT_PUBLIC_KALSHI_ENV — 'demo' | 'production' — drives DemoBanner render
+-- Prohibited NEXT_PUBLIC_ variables (CI grep deploy blockers):
+--   NEXT_PUBLIC_KALSHI_API_KEY      — must never exist
+--   NEXT_PUBLIC_PERPLEXITY_API_KEY  — must never exist
+--   NEXT_PUBLIC_ANTHROPIC_API_KEY   — must never exist
+-- ============================================================
+
+-- ============================================================
+-- SECURITY NOTES (no DB = no RLS needed, but documenting for audit)
+-- • No authentication layer — obscure Vercel URL is sole access control
+-- • No PII stored anywhere in the system
+-- • No financial transactions processed
+-- • All API keys server-side only — confirmed by CI grep on every deploy
+-- • localStorage data is client-controlled — all reads use try/catch
+--   with shape validation; malformed data resets to safe defaults
+-- • Citation URLs validated via URL constructor (protocol === 'https:')
+--   before anchor rendering — non-https rendered as plain text
+-- • kalshi_url values validated against Kalshi domain allowlist
+--   before use in TradeOnKalshiButton
+-- • Ticker params validated against /^[A-Z0-9\-]{1,64}$/ before
+--   forwarding to Kalshi API
+-- • All LLM-generated text rendered as escaped React strings —
+--   zero dangerouslySetInnerHTML (CI grep enforced)
+-- • Claude output validated by validateClaudeOutput() after parse:
+--   score clamped 1–10, direction enum check, probabilities 0–100,
+--   confidence enum check, string array type checks
+-- ============================================================
+
+-- ============================================================
+-- PHASE 2 DATABASE READINESS NOTE
+-- If KAO adds multi-user support, server-side watchlist persistence,
+-- or analysis history in Phase 2, the recommended schema would be:
+--
+-- CREATE TABLE watchlist_items (
+--   id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+--   user_id          uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+--   ticker           text NOT NULL CHECK (ticker ~ '^[A-Z0-9\-]{1,64}$'),
+--   title            text NOT NULL,
+--   category         text NOT NULL,
+--   score            smallint CHECK (score BETWEEN 1 AND 10),
+--   direction        text NOT NULL CHECK (direction IN ('YES','NO','PASS')),
+--   assessed_prob    numeric(5,2) CHECK (assessed_prob BETWEEN 0 AND 100),
+--   implied_prob     numeric(5,2) CHECK (implied_prob BETWEEN 0 AND 100),
+--   confidence       text NOT NULL CHECK (confidence IN ('high','medium','low')),
+--   key_factors      text[] NOT NULL DEFAULT '{}',
+--   summary          text NOT NULL,
+--   analyzed_at      timestamptz NOT NULL,
+--   kalshi_url       text NOT NULL,
+--   saved_yes_price  numeric(5,2) NOT NULL,  -- IMMUTABLE anchor
+--   created_at       timestamptz NOT NULL DEFAULT now(),
+--   updated_at       timestamptz NOT NULL DEFAULT now(),
+--   UNIQUE (user_id, ticker)
+-- );
+-- ALTER TABLE watchlist_items ENABLE ROW LEVEL SECURITY;
+-- CREATE POLICY "Users access own watchlist" ON watchlist_items
+--   USING (auth.uid() = user_id);
+--
+-- CREATE TABLE analysis_cache (
+--   id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+--   ticker                text NOT NULL CHECK (ticker ~ '^[A-Z0-9\-]{1,64}$'),
+--   score                 smallint CHECK (score BETWEEN 1 AND 10),
+--   direction             text NOT NULL CHECK (direction IN ('YES','NO','PASS')),
+--   assessed_probability  numeric(5,2) CHECK (assessed_probability BETWEEN 0 AND 100),
+--   implied_probability   numeric(5,2) CHECK (implied_probability BETWEEN 0 AND 100),
+--   confidence            text NOT NULL CHECK (confidence IN ('high','medium','low')),
+--   key_factors           text[] NOT NULL DEFAULT '{}',
+--   key_uncertainties     text[] NOT NULL DEFAULT '{}',
+--   prose_explanation     text NOT NULL,
+--   perplexity_context    text,
+--   perplexity_citations  text[] NOT NULL DEFAULT '{}',
+--   prose_only            boolean NOT NULL DEFAULT false,
+--   analyzed_at           timestamptz NOT NULL,
+--   created_at            timestamptz NOT NULL DEFAULT now(),
+--   updated_at            timestamptz NOT NULL DEFAULT now()
+-- );
+-- CREATE INDEX idx_analysis_cache_ticker ON analysis_cache (ticker);
+-- CREATE INDEX idx_analysis_cache_analyzed_at ON analysis_cache (analyzed_at DESC);
+--
+-- This Phase 2 schema is NOT executed in Phase 1.
+-- ============================================================
+
+SELECT 'KAO Foundation schema contract established. No tables created — Phase 1 uses localStorage only.' AS migration_status;
